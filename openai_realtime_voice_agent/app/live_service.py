@@ -31,6 +31,7 @@ Official references: developers.openai.com/api/docs/guides/{voice-websockets,
 live-delegation, live-conversations, live-migration}.
 """
 import asyncio
+import inspect
 import base64
 import json
 import logging
@@ -82,6 +83,7 @@ from app.live_router import (
     LOOKUP as ROUTE_LOOKUP,
     NOTHING as ROUTE_NOTHING,
     CONFIRM as ROUTE_CONFIRM,
+    PENDING as ROUTE_PENDING,
     REPLY as ROUTE_REPLY,
     RouteResult,
     ToolRun,
@@ -96,9 +98,10 @@ from app.live_classifier import CHAT as CLASSIFIED_CHAT
 from app import live_tasks
 from app.live_tasks import is_deferred_request
 from app.live_tasks import (
-    ANNOUNCE, IMESSAGE, REOPEN, SESSION, DeliveryLog, TaskPolicy, in_quiet_hours, joined_commentary,
-    normalize_request, progress_commentary, promotion_commentary, quiet_hours_end, result_commentary,
-    short_request, spoken_result, wants_text,
+    ANNOUNCE, IMESSAGE, REOPEN, SESSION, DeliveryLog, TaskPolicy, explain_ack_commentary, in_quiet_hours,
+    joined_commentary, normalize_request, progress_commentary, promotion_commentary, quiet_hours_end,
+    result_commentary, short_request, spoken_result, text_delivered_commentary, text_message_body, wants_text,
+    explain_offer_commentary,
 )
 from app.live_reply import (
     LiveReplyAdmission,
@@ -321,6 +324,18 @@ ROUTE_MIN_CHARS = 4
 # report is never silently forgotten. A deferred watch has its own, longer
 # bound (TaskPolicy.deferred_max_s).
 EXTERNAL_TASK_MAX_S = 1800.0
+# An explanation (ask_openclaw explain mode) has a 10-minute budget at the
+# bridge, which reports a failure itself; this is the backstop if it never does.
+EXPLAIN_TASK_MAX_S = 900.0
+# An explanation delivered into an open session counts as heard once audible
+# output has gone on this long after the commentary went in (rig 2026-10-14:
+# a result sent 0.8 s before the device's follow-up cut-off closed the
+# session was "delivered" and never heard). A session still open but silent
+# this long after the commentary is sent the result again.
+TASK_HEARD_MIN_S = 2.0
+TASK_HEARD_WAIT_S = 20.0
+# A result being spoken holds the session at most this long from the commentary.
+TASK_SPOKEN_HOLD_S = 90.0
 # A background result follows the foreground one no sooner than this, so the
 # two commentaries never race into the same response.
 TASK_AFTER_RESULT_S = 1.5
@@ -441,6 +456,26 @@ class RouterOp:
     # A deferred request ("tell me when X leaves"): answered when the event
     # fires, possibly hours later. Never holds a session, never narrated.
     deferred: bool = False
+    # An explanation (ask_openclaw explain mode): minutes of research. The
+    # voice set the expectation up front, so it holds no session and is not
+    # narrated; the result is a spoken summary (``result.text``) with a fuller
+    # write-up (``detail``) for a text, which the user may ask for meanwhile.
+    explain: bool = False
+    text_requested: bool = False
+    detail: str = ""
+    # The explanation went into an open session at this time and is not yet
+    # known to have been heard (see _task_heard_watch).
+    session_sent_mono: Optional[float] = None
+    # The route called ask_openclaw in explain mode (known at dispatch, before
+    # the acceptance): a promotion speaks the explain acknowledgement instead
+    # of the generic "still working" line, and only one acknowledgement is
+    # ever spoken (explain_ack_sent). ``speaker`` is the identified first
+    # name at the time, for the acknowledgement and the text's recipient.
+    explain_route: bool = False
+    explain_ack_sent: bool = False
+    speaker: str = ""
+    # The explanation was spoken to the end: it is never texted as well.
+    spoken_to_end: bool = False
     watch: Optional[asyncio.Task] = None       # promotion, then progress narration
     reopen_requested_mono: Optional[float] = None
     delivery: DeliveryLog = field(default_factory=DeliveryLog)
@@ -888,6 +923,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         #   on_task_reopen() -> awaitable bool: open a short session through the spend gate
         self.on_task_announce: Optional[Callable[[str, str], Awaitable[bool]]] = None
         self.on_task_message: Optional[Callable[[str], Awaitable[bool]]] = None
+        #   on_task_text(text, recipient) -> awaitable bool: a text the user asked for
+        #   (an explanation); the bridge resolves the identified speaker's first
+        #   name to its own route, else its default owner route
+        self.on_task_text: Optional[Callable[[str, str], Awaitable[bool]]] = None
         self.on_task_reopen: Optional[Callable[[], Awaitable[bool]]] = None
         self._session_started_mono: Optional[float] = None
         self._task_opened_session = False
@@ -1164,11 +1203,19 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         watch never does. Past the bound the ordinary idle rules close the
         session and the result arrives by a short new session or an
         announcement. This never opens a session, only declines to close one."""
-        bound = self.task_policy.hold_session_s
-        if bound <= 0 or not self._tasks:
+        if not self._tasks:
             return False
         now = time.monotonic()
-        return any(not t.deferred and not t.delivered and now - t.started_mono < bound
+        # A result that went into this session and is being spoken holds it
+        # until it has been heard (rig 2026-10-14: "follow-up quiet" closed
+        # the session one sentence into a 40 s explanation). Bounded.
+        if any(t.session_sent_mono is not None and now - t.session_sent_mono < TASK_SPOKEN_HOLD_S
+               for t in self._tasks.values()):
+            return True
+        bound = self.task_policy.hold_session_s
+        if bound <= 0:
+            return False
+        return any(not t.deferred and not t.explain and not t.delivered and now - t.started_mono < bound
                    for t in self._tasks.values())
 
     @property
@@ -3423,6 +3470,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
             return "a tool already ran"
         if op.background:
             return "a background task"
+        if any(t.explain and not t.delivered for t in self._tasks.values()):
+            # The voice offered a text for a pending explanation; the user's
+            # answer ("text would be great") must reach the router.
+            return "an explanation is pending"
         if self._gate != "pre":
             return f"gate {self._gate}"
         if op.delegations:
@@ -3538,6 +3589,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         op.tools_started = True
         if SLOW_TOOL.search(name):
             op.slow_tool = True
+        if name.rsplit("__", 1)[-1] == "ask_openclaw" and \
+                str((arguments or {}).get("mode") or "").strip().lower() == "explain":
+            op.explain_route = True
+            op.speaker = op.speaker or self._speaker_first_name()
         self._unsafe_to_replay_input = True
         running_key = json.dumps([name, arguments], sort_keys=True, default=str)
         running = self._router_running.get(running_key)
@@ -3619,7 +3674,8 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
             self._confirmation_awaiting = True
         if outcome.pending:
             self._register_external_task(op, name, outcome.task_id or call_id,
-                                         deferred=outcome.deferred or is_deferred_request(op.text))
+                                         deferred=outcome.deferred or is_deferred_request(op.text),
+                                         explain=bool(getattr(outcome, "explain", False)))
         if not outcome.ok and not outcome.pending_confirmation:
             logger.warning(f"⚠️ router tool {name} reported {outcome.kind}: {outcome.log_detail}")
         record = self.calls.mark_result(call_id, now=time.monotonic(), submitted=True,
@@ -3706,6 +3762,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
             result = op.result = RouteResult(ROUTE_REPLY, NOT_CAUGHT_TEXT, result.source, [],
                                              result.timings)
         text = result.commentary() if result is not None else None
+        if result is not None and result.kind == ROUTE_PENDING and result.explain and not result.deferred:
+            # The explain acknowledgement, with the identified speaker's name.
+            op.explain_ack_sent = True
+            text = explain_ack_commentary(op.speaker or self._speaker_first_name())
         now = time.monotonic()
         self._last_route_kind = result.kind if result is not None else None
         if op.classifier_task is not None and not op.classifier_task.done():
@@ -4169,7 +4229,14 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         did = next((d for d in reversed(op.delegations) if d not in op.answered_delegations), None)
         if did is not None:
             op.answered_delegations.update(op.delegations)
-        await self._send_commentary(promotion_commentary(op.text), did)
+        if op.explain_route and not op.explain_ack_sent:
+            # An explanation outliving the soft budget: the explain
+            # acknowledgement replaces the generic "still working" line, so
+            # the user hears one acknowledgement, not a stack of them.
+            op.explain_ack_sent = True
+            await self._send_commentary(explain_ack_commentary(op.speaker or self._speaker_first_name()), did)
+        else:
+            await self._send_commentary(promotion_commentary(op.text), did)
         self._note(self.on_backend_activity)
         # If the voice says nothing, the static clip tells the user the
         # request is still being worked on (as the old narration did).
@@ -4274,7 +4341,7 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         moment of an open conversation. A hand-off that never reports back is
         closed as failed after EXTERNAL_TASK_MAX_S."""
         policy = self.task_policy
-        while (not op.deferred and not op.done and not op.abandoned
+        while (not op.deferred and not op.explain and not op.done and not op.abandoned
                and op.progress_count < policy.progress_max):
             await asyncio.sleep(policy.progress_every_s)
             deadline = time.monotonic() + policy.progress_every_s
@@ -4288,7 +4355,8 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
                         f"the voice may say so ({op.progress_count})")
             await self._send_commentary(progress_commentary(op.text), None)
         if op.external_id and not op.done:
-            bound = policy.deferred_max_s if op.deferred else EXTERNAL_TASK_MAX_S
+            bound = (policy.deferred_max_s if op.deferred
+                     else EXPLAIN_TASK_MAX_S if op.explain else EXTERNAL_TASK_MAX_S)
             remaining = bound - (time.monotonic() - op.started_mono)
             if remaining > 0:
                 await asyncio.sleep(remaining)
@@ -4304,24 +4372,55 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
                     op.external_id, "The assistant did not report back in time.", False)
 
     def _register_external_task(self, op: RouterOp, name: str, task_id: str,
-                                deferred: bool = False) -> None:
+                                deferred: bool = False, explain: bool = False) -> None:
         """A tool accepted the work and will report back: wait for its result
         under the id it will arrive with. A deferred watch waits for its
-        event without holding a session or being narrated."""
+        event without holding a session or being narrated; so does an
+        explanation (the voice sets the expectation when it starts)."""
         if any(t.external_id == task_id for t in self._tasks.values()):
             return
         ext = RouterOp(op_id=f"{op.op_id}-ext", seq=op.seq, text=op.text, key=op.key,
                        started_mono=op.started_mono, tools_started=True, background=True,
-                       external_id=task_id, tool_name=name, deferred=deferred)
+                       external_id=task_id, tool_name=name, deferred=deferred, explain=explain,
+                       text_requested=explain and wants_text(op.text),
+                       speaker=op.speaker or (self._speaker_first_name() if explain else ""))
         self._tasks[ext.op_id] = ext
         ext.watch = self._spawn(self._task_progress_watch(ext), f"live-task-progress-{ext.op_id}")
         logger.info(f"🧺 router {op.op_id}: {name} continues elsewhere as "
-                    f"{'a watch' if deferred else 'task'} {task_id}; "
+                    f"{'a watch' if deferred else 'an explanation' if explain else 'task'} {task_id}; "
                     f"its {'event' if deferred else 'result'} is delivered when it arrives")
 
-    async def _claim_external_result(self, task_id: str, text: str, ok: bool = True) -> bool:
+    def request_text_delivery(self) -> str:
+        """The user asked for the pending explanation as a text (the voice
+        offered one): the newest undelivered explanation will be texted
+        instead of spoken. Returns its request, or "" when nothing is pending
+        or no text route is configured (the ``deliver_by_text`` tool)."""
+        if self._text_route() is None:
+            return ""
+        for op in reversed(list(self._tasks.values())):
+            if op.explain and not op.delivered and not op.abandoned:
+                op.text_requested = True
+                logger.info(f"💬 task {op.op_id}: the user asked for the explanation by text")
+                return op.text
+        return ""
+
+    def _speaker_first_name(self) -> str:
+        """The identified speaker's first name for the explain acknowledgement,
+        or "" (no name is better than a wrong one)."""
+        probe = self.speaker_probe
+        if probe is None:
+            return ""
+        try:
+            name = probe.name_for(probe.gate_speaker())
+        except Exception:
+            return ""
+        return str(name or "").strip().split(" ")[0] if name else ""
+
+    async def _claim_external_result(self, task_id: str, text: str, ok: bool = True,
+                                     detail: str = "") -> bool:
         """A result arrived for a hand-off (POST /task-result, or /announce
-        with the id). True when a pending task here was waiting for it."""
+        with the id). True when a pending task here was waiting for it.
+        ``detail`` is an explanation's fuller write-up, kept for a text."""
         for op in list(self._tasks.values()):
             if op.external_id and op.external_id == task_id and not op.done:
                 now = time.monotonic()
@@ -4329,6 +4428,7 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
                 op.result = RouteResult(ROUTE_LOOKUP if ok else ROUTE_FAILED, (text or "").strip(),
                                         "openclaw", [run],
                                         {"external_ms": int((now - op.started_mono) * 1000)})
+                op.detail = (detail or "").strip() if ok else ""
                 op.done = True
                 op.result_ready_mono = now
                 logger.info(f"📬 task {op.op_id}: result for {task_id} arrived after "
@@ -4397,7 +4497,8 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         async with self._task_flush_lock:
             retries = 0
             while True:
-                ready = [t for t in list(self._tasks.values()) if t.done and not t.delivered]
+                ready = [t for t in list(self._tasks.values())
+                         if t.done and not t.delivered and t.session_sent_mono is None]
                 if not ready:
                     return
                 deferred = False
@@ -4408,12 +4509,20 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
                     if op.result is None or op.result.kind == ROUTE_NOTHING:
                         self._finish_task(op, "none")
                         continue
+                    if (op.result.kind == ROUTE_PENDING and op.result.explain
+                            and not (self.session_ready and not self._closing and not self._disconnecting)):
+                        # The acceptance of an explanation is not worth a new
+                        # session; its answer comes with its own delivery.
+                        self._finish_task(op, "none")
+                        continue
                     if (now - (op.result_ready_mono or now) > self.task_policy.result_ttl_s
                             and not op.deferred):
                         logger.warning(f"⚠️ task {op.op_id}: result undeliverable for "
                                        f"{self.task_policy.result_ttl_s:.0f}s; dropped")
                         self._finish_task(op, "dropped")
                         continue
+                    if op.text_requested and await self._task_deliver_text(op):
+                        continue  # the user chose a text; voice only if that failed
                     if self.session_ready and not self._closing and not self._disconnecting:
                         if not self._session_free_for_delivery():
                             deferred = True
@@ -4430,9 +4539,64 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
                 retries += 1
                 await asyncio.sleep(TASK_FLUSH_RETRY_S)
 
+    def _text_route(self):
+        """The hook for a text the user asked for: ``on_task_text(text,
+        recipient)`` (wired whenever the bridge is configured), else the
+        fallback chain's ``on_task_message`` (a configured destination)."""
+        return self.on_task_text or self.on_task_message
+
+    async def _send_task_text(self, body: str, recipient: str = ""):
+        hook = self._text_route()
+        try:
+            params = inspect.signature(hook).parameters
+            takes_recipient = len(params) >= 2 or any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL for p in params.values())
+        except (TypeError, ValueError):
+            takes_recipient = False
+        if takes_recipient:
+            return await hook(body, recipient or "")
+        return await hook(body)
+
+    async def _task_deliver_text(self, op: RouterOp) -> bool:
+        """The user asked for this explanation as a text: send the write-up
+        through the bridge's verified iMessage sender and, if a conversation
+        is open and free, say that it was sent. A failure (not configured,
+        unverified) or a failed explanation falls back to the voice."""
+        result = op.result
+        if self._text_route() is None or result is None or result.kind != ROUTE_LOOKUP or not result.text:
+            return False
+        if op.spoken_to_end or op.delivered:
+            return False  # already heard in the conversation: never also texted
+        try:
+            ok = bool(await self._send_task_text(text_message_body(op.text, result.text, op.detail), op.speaker))
+        except Exception as e:
+            ok = False
+            logger.debug(f"task text failed: {e!r}")
+        if not ok:
+            op.delivery.note(IMESSAGE, False, "requested text not delivered; spoken instead")
+            logger.warning(f"⚠️ task {op.op_id}: the requested text was not delivered; the voice says it")
+            op.text_requested = False
+            return False
+        if (self.session_ready and not self._closing and not self._disconnecting
+                and self._session_free_for_delivery()):
+            if self._gate == "pre":
+                self._gate_open()
+            await self._send_commentary(text_delivered_commentary(op.text), None)
+        self._finish_task(op, IMESSAGE)
+        return True
+
     async def _task_deliver_session(self, op: RouterOp) -> None:
         result = op.result
-        text = result_commentary(result.kind, result.text, op.text, result.source, deferred=op.deferred)
+        text = result_commentary(result.kind, result.text, op.text, result.source, deferred=op.deferred,
+                                 explain=op.explain)
+        if (text is None and result.kind == ROUTE_PENDING and result.explain and not result.deferred
+                and not op.explain_ack_sent):
+            # The explanation was accepted after the soft budget had already
+            # made the voice say it was still working, and the promotion did
+            # not know it was an explanation (the tool was not dispatched yet).
+            # The expectation and the text offer are still owed, once.
+            op.explain_ack_sent = True
+            text = explain_offer_commentary()
         self._task_opened_session = False
         if text is None:
             self._finish_task(op, "none")
@@ -4446,7 +4610,55 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         self._gate_drop_until_ack = False
         await self._send_commentary(text, None)
         op.result_sent_mono = time.monotonic()
+        if op.explain and result.kind == ROUTE_LOOKUP:
+            # An explanation is finished only once it has been heard; a
+            # session that closes under it (the device's follow-up cut-off)
+            # hands the result back to the task list for another route.
+            op.session_sent_mono = op.result_sent_mono
+            self._spawn(self._task_heard_watch(op), f"live-task-heard-{op.op_id}")
+            return
         self._finish_task(op, SESSION)
+
+    async def _task_heard_watch(self, op: RouterOp) -> None:
+        """The explanation is finished once the voice has spoken it to the
+        end in a session that stayed open: audible output for at least
+        TASK_HEARD_MIN_S after the commentary, then quiet past the speech
+        hangover. A session closing while it is still being spoken, or
+        silence for TASK_HEARD_WAIT_S, hands the result back to the task
+        list. While this runs the task holds the session (_task_holds_session)."""
+        sent = op.session_sent_mono or time.monotonic()
+        deadline = sent + TASK_HEARD_WAIT_S
+        quiet_s = self.audio.speech_hangover_s + 0.5
+        while True:
+            await asyncio.sleep(0.2)
+            if op.delivered or op.abandoned or op.op_id not in self._tasks:
+                return
+            now = time.monotonic()
+            audible = self._last_audible_mono or 0.0
+            spoken_s = audible - sent
+            closed = not self.session_ready or self._closing or self._disconnecting
+            if spoken_s >= TASK_HEARD_MIN_S and not closed and not self._audio_queue.qsize() \
+                    and now - audible >= quiet_s:
+                op.spoken_to_end = True
+                self._finish_task(op, SESSION)
+                return
+            if closed:
+                if spoken_s >= TASK_SPOKEN_HOLD_S - TASK_HEARD_WAIT_S:
+                    self._finish_task(op, SESSION)  # spoken to (near) the end of the bound
+                    return
+                why = "the session closed before the result was heard to the end"
+                break
+            if spoken_s <= 0 and now > deadline:
+                why = f"nothing audible {TASK_HEARD_WAIT_S:.0f}s after the result went in"
+                break
+            if now - sent > TASK_SPOKEN_HOLD_S:
+                self._finish_task(op, SESSION)  # the hold is bounded; it was speaking all along
+                return
+        op.session_sent_mono = None
+        op.result_ready_mono = time.monotonic()  # the TTL restarts: this result is still owed
+        op.delivery.note(SESSION, False, why)
+        logger.warning(f"⚠️ task {op.op_id}: {why}; delivering it again")
+        self._task_flush_soon("result not heard")
 
     def _device_idle_s(self) -> float:
         last = max(self._last_user_delta_mono or 0.0, self._last_audible_mono or 0.0)
@@ -4457,7 +4669,7 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         announcement lane, or a text, in the configured order."""
         policy = self.task_policy
         result = op.result
-        spoken = spoken_result(result.kind, result.text, op.text, deferred=op.deferred)
+        spoken = spoken_result(result.kind, result.text, op.text, deferred=op.deferred, explain=op.explain)
         available = {
             REOPEN: self.on_task_reopen is not None,
             ANNOUNCE: self.on_task_announce is not None and spoken is not None,
@@ -4470,6 +4682,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
         plan = policy.plan(session_ready=False, idle_s=self._device_idle_s(),
                            available=lambda channel: available.get(channel, False),
                            deferred=op.deferred, wants_text=wants_text(op.text), quiet=quiet)
+        if op.explain and not op.text_requested and IMESSAGE in plan:
+            # An explanation is texted only when asked for, or when it could
+            # not be spoken at all (owner, 2026-10-14): a text is the last route.
+            plan = [c for c in plan if c != IMESSAGE] + [IMESSAGE]
         if quiet and not plan:
             # Quiet hours: no voice in the house. The event is told when they end.
             wait = quiet_hours_end(policy.quiet_hours)

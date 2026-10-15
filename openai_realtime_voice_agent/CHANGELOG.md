@@ -2,6 +2,54 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.19.1 (fork)
+
+
+### Added: explain mode for the household agent (router mode)
+
+"Can you explain how our bridge supports remote access?" is research, not a
+lookup (builds on the 0.19.0 router mode). The backend now calls `ask_openclaw` with `mode: "explain"` for a
+question about how the owner's own software, projects or systems work, are
+designed or stand. The request to the bridge carries a read-only research
+brief instead of the answer-only prefix (read the code and documents, change
+nothing, return a spoken summary of 20-40 seconds plus a short text version), a
+10-minute budget, and a session key that a follow-up within half an hour
+reuses, so "what about the auth part?" continues the same agent session.
+
+- The voice acknowledges at once, by name when the speaker is identified, in
+  one of several rotating phrasings (it takes a while, I'll get back to you,
+  a text summary is yours for the asking). When the route outlives the
+  soft budget the acknowledgement replaces the generic "still working" line,
+  so at most the fallback clip and one acknowledgement are heard.
+- The answer comes back by voice (the open conversation, a short new session
+  or an announcement in the Live voice) and is read in full, not briefly. The
+  task holds no session and is not narrated while it runs.
+- "Text would be great" after the acknowledgement (the new `deliver_by_text`
+  tool, chosen by the backend) switches that task to a text through the
+  bridge's verified iMessage sender. The add-on names the recognised speaker
+  (`notification_recipient`); the bridge resolves it to one of its routes or
+  its default owner route, so no option is needed (`live_task_imessage_to`
+  is an optional override). An open conversation hears "Done, it's in your
+  messages"; an idle device is not reopened for that. A text that cannot
+  be delivered falls back to voice. The text is the agent's short `TEXT:`
+  part (at most three plain sentences, trimmed by the add-on as well, no
+  header); an explanation that was spoken in the conversation is never
+  texted as well, and a text is the last route for one that could not be
+  spoken.
+- One explanation runs at a time (a second is refused by the bridge and the
+  voice says so). An explanation that never reports back is closed after
+  15 minutes.
+- An explanation spoken into an open session counts as delivered only once
+  it has been heard; a session closing under it (the device's follow-up
+  cut-off) hands the result to the next route (a reopened session, an
+  announcement) instead of losing it.
+- A result being spoken into a session holds that session until it has been
+  heard to the end (the device's follow-up cut-off and the add-on's own
+  follow-up-quiet close both used to cut it one sentence in).
+- Bridge contract: `mode`, `budget_s`; `/announce` and `/task-result` accept
+  `ok` and `detail` (the write-up) for a task result, and a task's text is
+  not cut at the bare lane's 600 characters. See `docs/agent-integration.md`.
+
 ## 0.19.0 (fork)
 
 ### Added: an experimental GPT-Live voice runtime (opt-in)

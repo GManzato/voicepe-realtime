@@ -36,6 +36,7 @@ the socket and the gate.
 """
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import unicodedata
@@ -270,14 +271,109 @@ def deferred_commentary(text: str = "") -> str:
             + "Say that briefly in your own words; do not say it has happened and do not guess when.")
 
 
+# The explain acknowledgement, rotated for variety (owner, 2026-10-14). Each
+# phrasing carries the same three things: it takes a while, I'll get back to
+# you, a text summary is there for the asking. None says "moment": the
+# fallback clip and the voice's own first words already do, and the
+# acknowledgement must not stack another one on top. ``{who}`` is ", Name" or "".
+EXPLAIN_ACK_PHRASES = (
+    "Hold on{who}. This one needs a proper look, so give me a few minutes and I'll come back to you. "
+    "If you'd rather have a summary by text, just say so.",
+    "Right{who}, that will take me a little while to dig into. I'll get back to you once I have it; "
+    "let me know if you'd prefer it as a text.",
+    "Let me look into that properly{who}. It'll be a few minutes, then I'll report back, or I can "
+    "text you a summary instead if you like.",
+    "That deserves a careful answer{who}. I'll find out and get back to you shortly; say the word "
+    "if you'd rather read it in a text.",
+)
+_ack_cycle = itertools.count()
+
+
+def explain_ack_commentary(name: str = "", pick: Optional[int] = None) -> str:
+    """Spoken at once when an explanation starts: it sets the expectation of
+    minutes, promises to come back, and offers a text, in one of several
+    phrasings (rotated; ``pick`` fixes one). ``name`` is the identified
+    speaker's first name, or "" for no name."""
+    who = f", {name.strip()}" if name and name.strip() else ""
+    index = next(_ack_cycle) if pick is None else pick
+    line = EXPLAIN_ACK_PHRASES[index % len(EXPLAIN_ACK_PHRASES)].format(who=who)
+    return ("The user asked for an explanation that needs a few minutes of research; it has "
+            "started and the answer is delivered when it is ready. Say now, in these words or "
+            f"very close to them: \"{line}\" Then stop. Do not say \"one moment\" or that you are "
+            "still working; do not guess the answer and do not say it is done.")
+
+
+def explain_offer_commentary() -> str:
+    """The explanation was accepted after the voice had already said it was
+    still working (the route outlived the soft budget): the expectation and
+    the text offer are still owed, in fewer words."""
+    return ("The user's request has been accepted as research that takes a few minutes; the answer "
+            "is delivered when it is ready. You already said you are still working on it. Add now, "
+            "in these words or very close to them: \"This one will take me a few minutes. I'll get "
+            "back to you; let me know if you'd prefer a summary over text instead.\" Then stop. Do "
+            "not guess the answer and do not say it is done.")
+
+
+def explain_result_commentary(text: str, request: str) -> str:
+    """Delivers a finished explanation into an open session: the voice reads
+    the summary in full (it was written for the ear), not a brief."""
+    return (f"The explanation you promised for the earlier request \"{short_request(request)}\" is "
+            f"ready. Here it is: {text} Say it to the user now in full, in your own words but "
+            "keeping every point; it is about half a minute of speech. Add nothing that is not "
+            "stated here.")
+
+
+def text_delivered_commentary(request: str) -> str:
+    """Only for a conversation that is already open: a natural line, not a
+    delivery report (owner: "sent" sounds technical). A closed device is not
+    reopened for this; the text itself is the signal."""
+    return (f"The explanation for the earlier request \"{short_request(request)}\" is now in the "
+            "user's messages, as they asked. Say so in a few natural words, for example "
+            "\"Done, it's in your messages.\" Do not say \"sent\" or \"delivered\", and add nothing else.")
+
+
+TEXT_MESSAGE_MAX_SENTENCES = 3
+TEXT_MESSAGE_MAX_CHARS = 320
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
+
+
+def trim_text_message(text: str, max_sentences: int = TEXT_MESSAGE_MAX_SENTENCES,
+                      max_chars: int = TEXT_MESSAGE_MAX_CHARS) -> str:
+    """At most ``max_sentences`` whole sentences and about ``max_chars``
+    characters, cut at a sentence end (owner, 2026-10-14: no verbose texts
+    after a conversation). A single oversized sentence is cut at a word."""
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    sentences = _SENTENCE_END.split(text)
+    out = ""
+    for sentence in sentences[:max_sentences]:
+        candidate = f"{out} {sentence}".strip()
+        if out and len(candidate) > max_chars:
+            break
+        out = candidate
+    if len(out) > max_chars:
+        out = out[:max_chars].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return out
+
+
+def text_message_body(request: str, spoken: str, detail: str = "") -> str:
+    """The text message for an explanation the user asked to have texted: the
+    agent's TEXT part (a few plain sentences), else the spoken summary; no
+    header, and never more than a few sentences whatever the agent sent."""
+    return trim_text_message((detail or "").strip() or (spoken or "").strip())
+
+
 def result_commentary(kind: str, text: str, request: str, source: str = "",
-                      deferred: bool = False) -> Optional[str]:
+                      deferred: bool = False, explain: bool = False) -> Optional[str]:
     """The commentary that delivers a finished background task into an open
     session. Mirrors ``RouteResult.commentary`` and adds the reference to the
     earlier request, so the voice frames it as the follow-up it is."""
     from app.live_router import ACTION, CHAT_KIND, CONFIRM, FAILED, LOOKUP, REPLY
     about = f"the earlier request \"{short_request(request)}\""
     text = (text or "").strip()
+    if explain and kind == LOOKUP and text:
+        return explain_result_commentary(text, request)
     if deferred and kind in (ACTION, LOOKUP) and text:
         return (f"The event the user asked to be told about has happened ({about}): {text} "
                 "Tell the user now, briefly, in your own words; add nothing that is not stated here.")
@@ -300,12 +396,15 @@ def result_commentary(kind: str, text: str, request: str, source: str = "",
     return None
 
 
-def spoken_result(kind: str, text: str, request: str, deferred: bool = False) -> Optional[str]:
+def spoken_result(kind: str, text: str, request: str, deferred: bool = False,
+                  explain: bool = False) -> Optional[str]:
     """One plain sentence for the announcement lane or a text message, where
     there is no voice model to word it."""
     from app.live_router import ACTION, CONFIRM, FAILED, LOOKUP, REPLY
     about = short_request(request)
     text = " ".join((text or "").split())
+    if explain and kind == LOOKUP and text:
+        return f"Here is what I found out about {about}: {text}"
     if deferred and kind in (ACTION, LOOKUP, REPLY) and text:
         return f"You asked me to tell you, {about}: {text}"
     if kind in (ACTION, LOOKUP, REPLY) and text:
@@ -340,15 +439,18 @@ def unregister_sink(sink: ExternalSink) -> None:
         pass
 
 
-async def deliver_external_result(task_id: str, text: str, ok: bool = True) -> bool:
+async def deliver_external_result(task_id: str, text: str, ok: bool = True, detail: str = "") -> bool:
     """Hand a finished external task to the service that is waiting for it.
-    True when a pending task claimed it; False when nobody knows the id."""
+    True when a pending task claimed it; False when nobody knows the id.
+    ``detail`` is a fuller write-up (an explanation's text-message body);
+    a sink that takes three arguments gets the call it always did."""
     task_id = (task_id or "").strip()
     if not task_id:
         return False
     for sink in list(_sinks):
         try:
-            if await sink(task_id, text, ok):
+            claimed = (await sink(task_id, text, ok, detail)) if detail else (await sink(task_id, text, ok))
+            if claimed:
                 return True
         except Exception:  # pragma: no cover - one bad sink never blocks the rest
             continue
