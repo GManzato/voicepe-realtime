@@ -155,6 +155,21 @@ class RouterHarness(LiveHarness):
         return b"".join(f.audio for f in self.sink.of(TTSAudioRawFrame))
 
 
+async def heard(h, timeout=5.0):
+    """The voice speaks the delivered background result to the end. Since
+    0.19.2 a result spoken from the task list is finished only once heard
+    (audible output, then quiet), so tests that look at ``tasks_pending`` after
+    a session delivery let the voice speak first."""
+    import time as _time
+    with patch.object(live_service_module, "TASK_HEARD_MIN_S", 0.3):
+        h.voice_says("Here it is.", ms=400)
+        await asyncio.sleep(0.35)
+        h.voice_says(" Done.", ms=400)
+        deadline = _time.monotonic() + timeout
+        while h.service.tasks_pending and _time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+
 def fast():
     return [patch.object(live_service_module, "USER_TURN_GAP_S", 0.05),
             patch.object(live_service_module, "ACK_LAG_S", 0.05),
@@ -688,6 +703,7 @@ class CancelledJoin(Patched):
             self.assertTrue(h.service._op.done)
             contents = [m["content"] for m in h.socket.of("session.commentary.append")]
             self.assertTrue(any("earlier request" in c and "on" in c for c in contents), contents)
+            await heard(h)
             self.assertEqual(h.service.tasks_pending, 0)
 
 
@@ -910,6 +926,58 @@ class NothingMeansSilence(Patched):
             sent = await h.wait_commentary()
             self.assertIn(NOT_CAUGHT_TEXT, sent[-1]["content"])
             self.assertEqual(h.executed, [])
+
+
+class RoomTalkClosesTheSession(Patched):
+    """Workshop rig 2026-10-16: a monologue spoken after a wake came in as
+    separate utterances, each answered "Sorry, I didn't catch that". The
+    second utterance with no request in one session closes it silently."""
+
+    async def _closes(self, h):
+        closed = []
+
+        async def close():
+            closed.append(1)
+
+        h.service.on_background_conversation = close
+        return closed
+
+    async def test_a_second_utterance_with_no_request_closes_silently(self):
+        backend = FakeBackend(response(message("NO_REQUEST")), response(message("NO_REQUEST")))
+        async with RouterHarness(self, backend) as h:
+            closed = await self._closes(h)
+            await h.user_says("and then the weather was fine all weekend")
+            await asyncio.sleep(0.3)
+            self.assertEqual(closed, [], "one utterance with no request is not a conversation")
+            with self.assertLogs("app.live_service", level="WARNING") as logs:
+                await h.user_says("we walked along the cliffs for a couple of hours")
+                await asyncio.sleep(0.3)
+            self.assertEqual(closed, [1])
+            self.assertTrue(any("background conversation" in m for m in logs.output))
+            self.assertFalse(any("cliffs" in m for m in logs.output), "never the words")
+            self.assertEqual(h.heard(), b"")
+
+    async def test_a_backend_say_it_again_counts_as_not_caught(self):
+        backend = FakeBackend(response(message("NO_REQUEST")),
+                              response(message("Sorry, could you say that again?")))
+        async with RouterHarness(self, backend) as h:
+            closed = await self._closes(h)
+            await h.user_says("and then the weather was fine all weekend")
+            await asyncio.sleep(0.3)
+            await h.user_says("we walked along the cliffs for a couple of hours")
+            await asyncio.sleep(0.3)
+            self.assertEqual(closed, [1])
+
+    async def test_a_request_between_does_not_close(self):
+        backend = FakeBackend(response(message("NO_REQUEST")),
+                              response(call("todo__get_items", {}, "c1")), response(message("Milk.")))
+        async with RouterHarness(self, backend) as h:
+            closed = await self._closes(h)
+            await h.user_says("and then the weather was fine all weekend")
+            await asyncio.sleep(0.3)
+            await h.user_says("What's on the shopping list?")
+            await h.wait_commentary()
+            self.assertEqual(closed, [])
 
 
 class OnlyAWaitingPhraseIsAnAcknowledgement(Patched):
