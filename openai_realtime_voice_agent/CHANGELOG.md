@@ -2,6 +2,31 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.19.3 (fork)
+
+### Added: discussions by voice (off by default)
+
+- `discussions_enabled` adds three generic tools (`list_open_discussions`,
+  `open_discussion`, `propose_decision`) that talk to the agent bridge's
+  `discuss` contract. Only an item's topic and question are said unless the
+  owner asks for details; a decision is read back, staged after a clear yes,
+  and confirmed by the owner by text, never final from voice.
+- While a discussion is open the session gets discussion bounds
+  (`discussion_max_session_s`, `discussion_quiet_s`), its spend reservation
+  grows within the daily caps, the device listens longer after each reply
+  (`discussion_follow_up_ms`), and the room-talk closes stand down.
+
+### Fixed
+
+- **Spoken prompts keep their first word.** The Live voice renderer placed
+  each cached line by the transcript's clock, which drifts from the received
+  audio; cached clips began mid-word ("Sure, one moment." was only "...ment",
+  heard as a short hiss before an answer). The cut is now calibrated to the
+  attempt's own audio and walked back to the speech's onset, and every cached
+  Live line is rendered again.
+- **A wake just as a session closes is no longer lost.** The close's forced
+  idle followed the new wake and stopped the device's mic for the new turn.
+
 ## 0.19.2 (fork)
 
 ### Changed: answers are heard to the end; the agent keeps a conversation
