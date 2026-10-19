@@ -4971,7 +4971,10 @@ class OpenAILiveLLMService(GuardedToolsMixin, LLMService):
             self._gate_lag.clear()
             self._gate_blocked = True
         try:
-            played = await player(self.device_id)
+            # The identified speaker's named clip when there is one: the
+            # voice's own "Sure, <name>." is held behind the clip and dropped.
+            name = self._speaker_first_name()
+            played = await (player(self.device_id, name) if name else player(self.device_id))
         except Exception as e:
             played = False
             logger.debug(f"fallback acknowledgement failed: {e!r}")

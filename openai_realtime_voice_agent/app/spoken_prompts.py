@@ -28,7 +28,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from typing import Awaitable, Callable, Dict, Iterable, Optional
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import httpx
 
@@ -66,6 +66,11 @@ PROMPTS: Dict[str, str] = {
 # Every contextual progress cue the runtime can play in a Live voice, so the
 # warm-up renders them all and no filler waits on synthesis.
 PROMPTS.update(GENERIC_CUES)
+
+
+def named_fallback_acks(name: str) -> List[str]:
+    """The fallback acknowledgements addressed to one household member."""
+    return [f"Sure, one moment, {name}.", f"On it, {name}.", f"One moment, {name}."]
 
 # Voices accepted by the speech endpoint. The Realtime voice is reused when it
 # is one of these, so prompts sound like the assistant.
@@ -296,8 +301,13 @@ class SpokenPrompts:
                  slow_tools: Iterable[str] = DEFAULT_SLOW_TOOLS, ack_delay_s: float = 1.0,
                  progress_delay_s: float = 0.4,
                  enabled: bool = True,
-                 silent_ack_tools: Iterable[str] = DEFAULT_SILENT_ACK_TOOLS):
+                 silent_ack_tools: Iterable[str] = DEFAULT_SILENT_ACK_TOOLS,
+                 names: Iterable[str] = ()):
         self.tts = tts
+        # The configured household first names: each gets its own fallback
+        # acknowledgements ("Sure, one moment, <name>."), rendered at warm-up.
+        self.names = [n for n in dict.fromkeys(
+            str(n).strip().split(" ")[0] for n in names or () if str(n).strip())]
         self._play = play
         self.slow_tools = {t.strip() for t in slow_tools if t and t.strip()}
         # Compared on the bare name, so an allow-list entry works whether or
@@ -316,10 +326,13 @@ class SpokenPrompts:
         cached for good, so the first filler of the day is never slower than
         a cached one. Nothing is pre-rendered in another voice.
         """
+        texts = list(PROMPTS.values())
+        for name in self.names:
+            texts += named_fallback_acks(name)
         if self.tts.live:
-            await self.tts.render_live(list(PROMPTS.values()))
+            await self.tts.render_live(texts)
             return
-        for text in PROMPTS.values():
+        for text in texts:
             await self.tts.get(text)
 
     @staticmethod
@@ -355,18 +368,27 @@ class SpokenPrompts:
 
     FALLBACK_ACK_KEYS = ("ack_sure", "ack_on_it", "ack")
 
-    async def say_fallback_ack(self, device_id: str) -> bool:
+    async def say_fallback_ack(self, device_id: str, name: Optional[str] = None) -> bool:
         """One static acknowledgement, only from the cache and only in the
         assistant's own voice; never synthesized while the user waits and
         never in a second voice. Independent of ``slow_tool_ack``: it is the
-        router's fallback for a silent voice, not a slow-tool cue."""
-        keys = list(self.FALLBACK_ACK_KEYS)
+        router's fallback for a silent voice, not a slow-tool cue.
+
+        ``name`` is the identified speaker: their named clip when it was
+        rendered (the clip replaces the voice's own "Sure, <name>.", which
+        is held behind it and dropped), else an unnamed one."""
         self._fallback_turn = getattr(self, "_fallback_turn", -1) + 1
-        start = self._fallback_turn % len(keys)
-        for key in keys[start:] + keys[:start]:
-            pcm = self.tts.cached(PROMPTS[key])
-            if pcm:
-                return await self._play(pcm, device_id)
+        first = str(name or "").strip().split(" ")[0]
+        texts = named_fallback_acks(first) if first in self.names else []
+        unnamed = [PROMPTS[key] for key in self.FALLBACK_ACK_KEYS]
+        for group in (texts, unnamed):
+            if not group:
+                continue
+            start = self._fallback_turn % len(group)
+            for text in group[start:] + group[:start]:
+                pcm = self.tts.cached(text)
+                if pcm:
+                    return await self._play(pcm, device_id)
         return False
 
     async def say_progress(self, tool_name: str, arguments, speaker_name: Optional[str],

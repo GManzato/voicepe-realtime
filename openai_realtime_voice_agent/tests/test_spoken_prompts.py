@@ -11,7 +11,8 @@ from app.live_voice_prompts import LiveVoiceUnavailable
 from app.main import SafeRealtimeLLMService
 from app.phase_emitter import TurnLiveness
 from app.progress_ack import GENERIC_CUES
-from app.spoken_prompts import PROMPTS, SpokenPrompts, TTSCache, classify_error, pick_voice
+from app.spoken_prompts import (PROMPTS, SpokenPrompts, TTSCache, classify_error, named_fallback_acks,
+                                pick_voice)
 from app.turn_timeline import TurnTimeline
 
 
@@ -313,6 +314,41 @@ class TestLiveModePromptsUseTheAssistantVoice(unittest.IsolatedAsyncioTestCase):
             "todo__HassListAddItem", {"item": "cookies", "list": "shopping list"}, "Sam",
             "add cookies to the shopping list", "kitchen"))
         self.assertEqual(FakeHttp.calls, 1)
+
+
+class TestNamedFallbackAck(unittest.IsolatedAsyncioTestCase):
+    """The router's fallback clip replaces the voice's own "Sure, <name>.",
+    so an identified speaker gets a named clip, rendered at warm-up."""
+
+    async def asyncSetUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.renderer = FakeLiveRenderer()
+        self.tts = TTSCache("key", "alloy", cache_dir=self.tmp,
+                            client_factory=lambda: FakeHttp(),
+                            live_voice="vesper", live_renderer=self.renderer)
+        self.played = []
+
+        async def play(pcm, device_id):
+            self.played.append(pcm)
+            return True
+
+        self.prompts = SpokenPrompts(self.tts, play, names=(" Sam ", "", "Alex"))
+        await self.prompts.warm()
+
+    async def test_warm_renders_the_named_clips(self):
+        for name in ("Sam", "Alex"):
+            for text in named_fallback_acks(name):
+                self.assertEqual(self.tts.cached(text), live_pcm(text))
+
+    async def test_an_identified_speaker_hears_their_name(self):
+        self.assertTrue(await self.prompts.say_fallback_ack("kitchen", "Sam"))
+        self.assertIn(self.played[-1], [live_pcm(t) for t in named_fallback_acks("Sam")])
+
+    async def test_no_name_or_an_unknown_name_plays_an_unnamed_clip(self):
+        unnamed = [live_pcm(PROMPTS[k]) for k in SpokenPrompts.FALLBACK_ACK_KEYS]
+        for name in (None, "", "Robin"):
+            self.assertTrue(await self.prompts.say_fallback_ack("kitchen", name))
+            self.assertIn(self.played[-1], unnamed, name)
 
 
 if __name__ == "__main__":
