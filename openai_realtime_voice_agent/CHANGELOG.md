@@ -2,6 +2,17 @@
 
 All notable changes to this add-on. Newest first.
 
+## 0.19.5
+
+### Fixed: GPT-Live's native-language voices were refused
+
+- OpenAI's GPT-Live voice table also lists native-language voices: `nuri`,
+  `juni`, `flitz` (German), `brise`, `sillage` (French), `nira` (Hindi),
+  `harema`, `shida` (Japanese) and `noeul` (Korean). The Live voice list did
+  not include them, so `openai_voice_custom: brise` logged "not a documented
+  GPT-Live voice" and the session spoke with the server default instead. They
+  are now accepted like the other Live voices.
+
 ## 0.19.4 (fork)
 
 ### Fixed: the speaker's name in router mode
