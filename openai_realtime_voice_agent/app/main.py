@@ -951,6 +951,7 @@ class Application:
             # 2026-10-07, retriggered the device's own wake word, and the
             # resulting new wake cancelled the answer.
             silent_ack_tools=_env_list("ACK_SILENT_TOOLS", ",".join(DEFAULT_SILENT_ACK_TOOLS)),
+            names=(speaker_male_name, speaker_female_name),
         )
         self.speak_errors = _env_bool("SPEAK_ERRORS", True)
         self._last_error_spoken = {}
@@ -1699,8 +1700,16 @@ class Application:
                                      token_getter=self._ha_token)
         # The asking satellite goes with every local recognition, so Home
         # Assistant resolves "the lights" to that device's room (haintent).
+        # Who is speaking (app/speaker_context.py), read per turn: the probe
+        # is attached to the connection and resets on every wake.
+        from app.speaker_context import router_note
+
+        def _speaker_note() -> str:
+            note = router_note(getattr(connection, "speaker_probe", None))
+            return f"\n{note}" if note else ""
+
         router = TurnRouter(backend, recognizer=self.ha_intents,
-                            context=lambda: router_context() + snapshot.block(),
+                            context=lambda: router_context() + _speaker_note() + snapshot.block(),
                             device_id=connection.device_id or None, household=household,
                             satellite_ip=getattr(getattr(getattr(connection, "websocket", None),
                                                          "client", None), "host", None))

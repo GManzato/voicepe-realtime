@@ -202,6 +202,23 @@ class SpeakerProbe:
             self._classifying = False
 
 
+def router_note(probe: Optional["SpeakerProbe"]) -> str:
+    """Who is speaking, for the router backend's per-turn context. The voice
+    hears this through ``verdict_text``; without it the backend could not
+    answer "do you know who I am?" or a request that depends on the person."""
+    if probe is None or not probe.enabled:
+        return ""
+    label = probe.gate_speaker()
+    name = probe.current_name if label in ("male", "female", "match") else None
+    if name:
+        how = ("their enrolled voice print" if probe.current_method == "voiceprint"
+               else "voice pitch only, so it may be wrong")
+        return f"The voice check identifies the speaker as {name} ({how})."
+    if label == "unknown" and probe.current_method == "voiceprint":
+        return "The voice check did not match the speaker to anyone in the household."
+    return "The voice check has not identified the speaker this turn."
+
+
 def verdict_text(probe: "SpeakerProbe", label: str, name: Optional[str], f0: float) -> str:
     """The system-item text injected into the Realtime session."""
     if label == "unknown":

@@ -55,6 +55,37 @@ class _Fast(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(step_ms / 1000)
 
 
+class FallbackClipNamesTheSpeaker(_Fast):
+    async def test_an_identified_speaker_is_passed_to_the_clip(self):
+        """The clip replaces the voice's own "Sure, <name>.", so it carries
+        the identified speaker's name; no name when nobody was identified."""
+        from app.speaker_context import SpeakerProbe
+
+        for verdict, want in ((("male", "Alex"), ["Alex"]), (None, [])):
+            backend = FakeBackend(response(call("todo__get_items", {}, "c1")), response(message("Sunny.")))
+            backend.gate.clear()
+            async with RouterHarness(self, backend) as h:
+                probe = SpeakerProbe("Alex", "Sam")
+                if verdict:
+                    probe.current_label, probe.current_name = verdict
+                    probe.current_method = "voiceprint"
+                    probe._verdict_at = __import__("time").monotonic()
+                h.service.speaker_probe = probe
+                names = []
+
+                async def clip(device_id, name=None):
+                    if name:
+                        names.append(name)
+                    return True
+                h.service.on_fallback_ack = clip
+                with self.assertLogs("app.live_service", level="WARNING"):
+                    await h.user_says("What's the weather tomorrow?")
+                    await asyncio.sleep(0.5)
+                self.assertEqual(names, want)
+                backend.gate.set()
+                await h.wait_commentary()
+
+
 class FallbackClipCountsOnlyHeardAudio(_Fast):
     async def test_held_speech_does_not_block_the_clip(self):
         """A guess at the result is held, never heard: the clip still plays."""
